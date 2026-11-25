@@ -310,20 +310,28 @@ def _as_mapping(value: Any) -> Mapping:
 
 
 def reject_external(doctype: dict) -> bool:
-    """Return True when a DOCTYPE names an external entity or external DTD."""
+    """Return True when a DOCTYPE names an external entity or external DTD.
+
+    Every external identifier is rejected regardless of its scheme so that a
+    document can never coerce the parser into reading a local file or
+    contacting the network.  Scheme classification is left to
+    :func:`check_scheme`.
+    """
 
     if not isinstance(doctype, Mapping):
         return True
 
-    external_id = str(doctype.get("external_id") or "").lower()
-    if external_id.startswith("file:"):
+    if doctype.get("external_id") or doctype.get("public_id"):
         return True
 
     for entity in _as_mapping(doctype.get("entities")).values():
         if not isinstance(entity, Mapping):
             continue
-        system_id = str(entity.get("system_id") or "").lower()
-        if entity.get("external") and system_id.startswith("file:"):
+        if entity.get("external"):
+            return True
+        # A system/public identifier makes the declaration external even if a
+        # caller built the mapping without the ``external`` flag.
+        if entity.get("system_id") or entity.get("public_id"):
             return True
 
     return False
@@ -374,18 +382,24 @@ def check_entities(doctype: dict, policy: dict) -> list[str]:
     max_entities = _policy_limit(policy, "max_entities", DEFAULT_MAX_ENTITIES)
     max_depth = _policy_limit(policy, "max_entity_depth", DEFAULT_MAX_ENTITY_DEPTH)
 
-    external_count = sum(
-        1 for entity in entities.values() if bool(entity.get("external"))
-    )
-    if external_count > max_entities:
-        problems.append(f"too_many_entities:{external_count}>{max_entities}")
+    entity_count = len(entities)
+    if entity_count > max_entities:
+        problems.append(f"too_many_entities:{entity_count}>{max_entities}")
 
-    for name, entity in entities.items():
-        value = str(entity.get("value") or "")
-        direct_references = len(_ENTITY_REF_RE.findall(value))
-        if direct_references > max_depth:
+    memo: dict[str, int] = {}
+    cycle_reported = False
+    for name in entities:
+        try:
+            depth = _entity_depth(name, entities, memo, frozenset())
+        except ValueError:
+            # A reference cycle can never expand safely; report it once.
+            if not cycle_reported:
+                problems.append(f"entity_cycle:{name}")
+                cycle_reported = True
+            continue
+        if depth > max_depth:
             problems.append(
-                f"entity_depth_exceeded:{name}:{direct_references}>{max_depth}"
+                f"entity_depth_exceeded:{name}:{depth}>{max_depth}"
             )
 
     return problems
@@ -400,7 +414,7 @@ def check_scheme(uri: str) -> bool:
         parts = urlsplit(uri.strip())
     except ValueError:
         return False
-    return bool(parts.scheme)
+    return parts.scheme.lower() in SAFE_SCHEMES
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +446,13 @@ def _expand_entities(
     policy: Mapping,
     cache: Mapping | None,
     allow_external: bool,
+    _depth: int = 0,
+    _trail: frozenset[str] = frozenset(),
 ) -> str:
+    max_depth = _policy_limit(policy, "max_entity_depth", DEFAULT_MAX_ENTITY_DEPTH)
+    if _depth > max_depth:
+        raise XXESecurityError("entity expansion depth limit exceeded")
+
     def replace(match: re.Match) -> str:
         name = match.group(1)
         if name in _XML_BUILTINS:
@@ -445,10 +465,16 @@ def _expand_entities(
             entity = entities[name]
 
         if not isinstance(entity, Mapping):
+            # Leave the reference untouched so the strict XML parser rejects
+            # an undefined entity instead of silently dropping it.
             return match.group(0)
+
+        if name in _trail:
+            raise XXESecurityError("entity cycle is not allowed: " + name)
 
         if entity.get("external"):
             if not allow_external:
+                # Refuse before any resolution so no file or socket is touched.
                 raise XXESecurityError(
                     "external entity reference is not allowed: " + name
                 )
@@ -462,7 +488,15 @@ def _expand_entities(
             if not isinstance(replacement, str):
                 replacement = str(replacement)
 
-        return _expand_entities(replacement, entities, policy, cache, allow_external)
+        return _expand_entities(
+            replacement,
+            entities,
+            policy,
+            cache,
+            allow_external,
+            _depth + 1,
+            _trail | {name},
+        )
 
     return _ENTITY_REF_RE.sub(replace, text)
 
@@ -495,6 +529,14 @@ class _TreeBuilder:
             parent.text = (parent.text or "") + data
 
 
+def _refuse_external_entity(_context: Any, _base: Any, system_id: Any, _public_id: Any) -> int:
+    """External entity callback that always rejects instead of fetching."""
+
+    raise XXESecurityError(
+        "external entity reference is not allowed: " + str(system_id or "")
+    )
+
+
 def _parse_tree(text: str, lenient: bool) -> Element:
     builder = _TreeBuilder()
     parser = expat.ParserCreate()
@@ -503,10 +545,18 @@ def _parse_tree(text: str, lenient: bool) -> Element:
     parser.CharacterDataHandler = builder.data
     parser.ProcessingInstructionHandler = lambda _target, _data: None
     parser.CommentHandler = lambda _data: None
-    parser.ExternalEntityRefHandler = lambda *_args: 0
+    parser.ExternalEntityRefHandler = _refuse_external_entity
+    try:
+        parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    except Exception:
+        # Some expat builds do not expose the switch; the DOCTYPE has already
+        # been stripped and external refs are refused by the handler above.
+        pass
 
     try:
         parser.Parse(text, True)
+    except XXEError:
+        raise
     except expat.ExpatError as exc:
         if lenient and builder.root is not None:
             return builder.root
@@ -541,6 +591,8 @@ def _parse_document(
     policy: dict,
     shared_entities: dict | None = None,
 ) -> Element:
+    if isinstance(text, bytes):
+        text = text.decode("utf-8")
     if not isinstance(text, str):
         raise XXEParseError("document must be text")
 
@@ -556,18 +608,23 @@ def _parse_document(
     if entity_problems:
         raise XXESecurityError("entity policy violation: " + "; ".join(entity_problems))
 
-    cache = shared_entities if shared_entities is not None else {}
+    # Every parse gets a private, empty expansion cache so one document can
+    # never influence another.  ``shared_entities`` is accepted for signature
+    # compatibility but intentionally not used.
     root = _parse_body(
         text,
         doctype,
         policy,
-        cache,
-        allow_external=True,
-        lenient=True,
+        {},
+        allow_external=False,
+        lenient=False,
     )
 
-    if shared_entities is not None:
-        shared_entities.update(_as_mapping(doctype.get("entities")))
+    element_problems = check_elements(root, policy.get("allowed_elements"))
+    if element_problems:
+        raise XXESecurityError(
+            "element policy violation: " + "; ".join(element_problems)
+        )
 
     return root
 
@@ -611,6 +668,10 @@ def validate_policy(policy: dict) -> list[str]:
         return ["policy_must_be_a_mapping"]
 
     problems: list[str] = []
+    if policy.get("allow_external_entities") is not False:
+        problems.append("allow_external_entities_must_be_false")
+    if policy.get("allow_external_dtd") is not False:
+        problems.append("allow_external_dtd_must_be_false")
     if not _positive_int(policy.get("max_entities")):
         problems.append("max_entities_missing")
     if not _positive_int(policy.get("max_entity_depth")):
@@ -630,13 +691,13 @@ def xxe_batch(docs: list[str], policy: dict) -> dict:
 
     results: list[Element | None] = []
     errors: list[str | None] = []
-    shared_entities: dict = {}
 
     for document in docs or []:
         try:
-            if isinstance(document, bytes):
-                document = document.decode("utf-8")
-            root = _parse_document(document, policy, shared_entities)
+            # No entity cache is shared: each call scans and expands only its
+            # own DOCTYPE, so a failure or declaration in one document cannot
+            # leak into another position.
+            root = parse_document(document, policy)
             results.append(root)
             errors.append(None)
         except Exception as exc:
