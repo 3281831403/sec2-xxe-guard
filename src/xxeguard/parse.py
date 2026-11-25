@@ -3,7 +3,23 @@
 The public entry points work on plain text and Element objects.  A policy
 describes the entity limits, the element whitelist and whether external
 constructs are permitted.  External identifiers are described by
-``scan_doctype`` but are not fetched by this module.
+``scan_doctype`` but are never fetched by this module: no code path opens a
+file or a socket.
+
+Security model
+--------------
+
+* External entities and external DTDs are rejected outright.  The policy keys
+  ``allow_external_entities`` and ``allow_external_dtd`` must be ``False``.
+* The number of entity declarations and the depth of entity expansion are
+  bounded.  Expansion is performed by this module under both limits, so a
+  document cannot make the process allocate an unbounded amount of text.
+* Any malformed document -- including a malformed DTD -- rejects the whole
+  document; no partial tree is ever returned.
+* Only elements named by the policy whitelist may appear in the result.
+* Processing instructions and comments are ignored.
+* Batch parsing keeps no state between documents; each document is parsed
+  from scratch and a failure only affects its own slot.
 """
 
 from __future__ import annotations
@@ -18,6 +34,13 @@ SAFE_SCHEMES = frozenset({"urn"})
 
 DEFAULT_MAX_ENTITIES = 16
 DEFAULT_MAX_ENTITY_DEPTH = 4
+
+# Hard ceilings applied while expanding entities.  They are independent from
+# the policy: even when a policy asks for very large limits a single document
+# cannot make expansion run away.  Both are far above anything an invoice
+# needs.
+MAX_ENTITY_EXPANSIONS = 10_000
+MAX_EXPANDED_CHARS = 2_000_000
 
 _NAME = r"[A-Za-z_:][A-Za-z0-9_.:-]*"
 _NAME_RE = re.compile(_NAME)
@@ -40,8 +63,31 @@ class XXEParseError(XXEError):
 
 
 # ---------------------------------------------------------------------------
-# DTD scanning
+# Low level scanning helpers
 # ---------------------------------------------------------------------------
+
+
+def _skip_comment(text: str, index: int) -> int:
+    """Return the index after the comment starting at ``index``."""
+
+    end = text.find("-->", index + 4)
+    if end < 0:
+        raise XXEParseError("unterminated comment")
+    return end + 3
+
+
+def _skip_pi(text: str, index: int) -> int:
+    end = text.find("?>", index + 2)
+    if end < 0:
+        raise XXEParseError("unterminated processing instruction")
+    return end + 2
+
+
+def _skip_cdata(text: str, index: int) -> int:
+    end = text.find("]]>", index + 9)
+    if end < 0:
+        raise XXEParseError("unterminated CDATA section")
+    return end + 3
 
 
 def _find_doctype_span(text: str) -> tuple[int, int] | None:
@@ -51,22 +97,13 @@ def _find_doctype_span(text: str) -> tuple[int, int] | None:
     length = len(text)
     while index < length:
         if text.startswith("<!--", index):
-            end = text.find("-->", index + 4)
-            if end < 0:
-                return None
-            index = end + 3
+            index = _skip_comment(text, index)
             continue
         if text.startswith("<![CDATA[", index):
-            end = text.find("]]>", index + 9)
-            if end < 0:
-                return None
-            index = end + 3
+            index = _skip_cdata(text, index)
             continue
         if text.startswith("<?", index):
-            end = text.find("?>", index + 2)
-            if end < 0:
-                return None
-            index = end + 2
+            index = _skip_pi(text, index)
             continue
         if text.startswith("<!DOCTYPE", index):
             return _doctype_end(text, index)
@@ -77,8 +114,15 @@ def _find_doctype_span(text: str) -> tuple[int, int] | None:
 def _doctype_end(text: str, start: int) -> tuple[int, int]:
     depth = 0
     quote: str | None = None
-    index = start + 9
+    index = start + len("<!DOCTYPE")
     while index < len(text):
+        if quote is None:
+            if text.startswith("<!--", index):
+                index = _skip_comment(text, index)
+                continue
+            if text.startswith("<?", index):
+                index = _skip_pi(text, index)
+                continue
         char = text[index]
         if quote is not None:
             if char == quote:
@@ -89,6 +133,8 @@ def _doctype_end(text: str, start: int) -> tuple[int, int]:
             depth += 1
         elif char == "]":
             depth -= 1
+            if depth < 0:
+                raise XXEParseError("unbalanced internal subset")
         elif char == ">" and depth == 0:
             return start, index + 1
         index += 1
@@ -108,24 +154,43 @@ def _read_literal(text: str, index: int) -> tuple[str, int]:
 
 
 def _parse_external_head(head: str) -> dict[str, str | None]:
-    public_id: str | None = None
-    system_id: str | None = None
+    """Parse the part of a DOCTYPE between its name and the internal subset.
 
-    public = re.search(r"PUBLIC\s*(['\"])(.*?)\1\s*(['\"])(.*?)\3", head, re.S | re.I)
+    An empty head means the DOCTYPE has no external identifier.  Anything
+    else must be a well formed SYSTEM or PUBLIC declaration; junk is a parse
+    error rather than something to ignore.
+    """
+
+    text = head.strip()
+    if not text:
+        return {"public_id": None, "system_id": None}
+
+    public = re.fullmatch(
+        r"(?is)PUBLIC\s*(['\"])(.*?)\1\s*(['\"])(.*?)\3\s*", text
+    )
     if public:
-        public_id = public.group(2)
-        system_id = public.group(4)
-    else:
-        system = re.search(r"SYSTEM\s*(['\"])(.*?)\1", head, re.S | re.I)
-        if system:
-            system_id = system.group(2)
+        return {"public_id": public.group(2), "system_id": public.group(4)}
 
-    return {"public_id": public_id, "system_id": system_id}
+    system = re.fullmatch(r"(?is)SYSTEM\s*(['\"])(.*?)\1\s*", text)
+    if system:
+        return {"public_id": None, "system_id": system.group(2)}
+
+    raise XXEParseError("malformed DOCTYPE external identifier")
 
 
 def _find_unquoted(text: str, target: str) -> int:
     quote: str | None = None
-    for index, char in enumerate(text):
+    index = 0
+    length = len(text)
+    while index < length:
+        if quote is None:
+            if text.startswith("<!--", index):
+                index = _skip_comment(text, index)
+                continue
+            if text.startswith("<?", index):
+                index = _skip_pi(text, index)
+                continue
+        char = text[index]
         if quote is not None:
             if char == quote:
                 quote = None
@@ -133,6 +198,7 @@ def _find_unquoted(text: str, target: str) -> int:
             quote = char
         elif char == target:
             return index
+        index += 1
     return -1
 
 
@@ -141,6 +207,13 @@ def _matching_bracket(text: str, start: int) -> int:
     depth = 0
     index = start
     while index < len(text):
+        if quote is None:
+            if text.startswith("<!--", index):
+                index = _skip_comment(text, index)
+                continue
+            if text.startswith("<?", index):
+                index = _skip_pi(text, index)
+                continue
         char = text[index]
         if quote is not None:
             if char == quote:
@@ -153,6 +226,8 @@ def _matching_bracket(text: str, start: int) -> int:
             depth -= 1
             if depth == 0:
                 return index
+            if depth < 0:
+                raise XXEParseError("unbalanced internal subset")
         index += 1
     raise XXEParseError("unterminated internal subset")
 
@@ -173,7 +248,20 @@ def _declaration_end(text: str, start: int) -> int:
     raise XXEParseError("unterminated entity declaration")
 
 
-def _parse_entity_declaration(raw: str) -> tuple[str, dict[str, Any]] | None:
+def _strip_comments(text: str) -> str:
+    parts: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text.startswith("<!--", index):
+            index = _skip_comment(text, index)
+            continue
+        parts.append(text[index])
+        index += 1
+    return "".join(parts)
+
+
+def _parse_entity_declaration(raw: str) -> tuple[str, dict[str, Any]]:
     index = 0
     while index < len(raw) and raw[index].isspace():
         index += 1
@@ -186,27 +274,36 @@ def _parse_entity_declaration(raw: str) -> tuple[str, dict[str, Any]] | None:
 
     match = _NAME_RE.match(raw, index)
     if not match:
-        return None
+        raise XXEParseError("malformed entity declaration")
     name = match.group(0)
     index = match.end()
     while index < len(raw) and raw[index].isspace():
         index += 1
-    rest = raw[index:].strip()
+    rest = raw[index:]
 
     external = False
     value: str | None = None
     public_id: str | None = None
     system_id: str | None = None
 
-    if rest[:6].upper() == "SYSTEM":
-        system_id, _ = _read_literal(rest, 6)
+    keyword = rest[:6].upper()
+    if keyword == "SYSTEM":
+        system_id, cursor = _read_literal(rest, 6)
         external = True
-    elif rest[:6].upper() == "PUBLIC":
+        trailer = rest[cursor:].strip()
+        if trailer and not re.fullmatch(r"(?is)NDATA\s+" + _NAME, trailer):
+            raise XXEParseError("malformed external entity declaration")
+    elif keyword == "PUBLIC":
         public_id, cursor = _read_literal(rest, 6)
-        system_id, _ = _read_literal(rest, cursor)
+        system_id, cursor = _read_literal(rest, cursor)
         external = True
+        trailer = rest[cursor:].strip()
+        if trailer and not re.fullmatch(r"(?is)NDATA\s+" + _NAME, trailer):
+            raise XXEParseError("malformed external entity declaration")
     else:
-        value, _ = _read_literal(rest, 0)
+        value, cursor = _read_literal(rest, 0)
+        if rest[cursor:].strip():
+            raise XXEParseError("malformed entity declaration")
 
     entity = {
         "name": name,
@@ -220,7 +317,7 @@ def _parse_entity_declaration(raw: str) -> tuple[str, dict[str, Any]] | None:
 
 
 def _scan_entity_declarations(subset: str) -> dict[str, dict[str, Any]]:
-    clean = re.sub(r"<!--.*?-->", "", subset, flags=re.S)
+    clean = _strip_comments(subset)
     entities: dict[str, dict[str, Any]] = {}
     index = 0
     while True:
@@ -229,12 +326,19 @@ def _scan_entity_declarations(subset: str) -> dict[str, dict[str, Any]]:
             break
         end = _declaration_end(clean, index)
         raw = clean[index + len("<!ENTITY") : end]
-        parsed = _parse_entity_declaration(raw)
-        if parsed is not None:
-            name, entity = parsed
-            entities[name] = entity
+        name, entity = _parse_entity_declaration(raw)
+        if name in entities:
+            # Duplicate declarations make the effective binding ambiguous;
+            # refuse rather than guess which one a later expansion would use.
+            raise XXEParseError("duplicate entity declaration: " + name)
+        entities[name] = entity
         index = end + 1
     return entities
+
+
+# ---------------------------------------------------------------------------
+# DTD scanning
+# ---------------------------------------------------------------------------
 
 
 def scan_doctype(text: str) -> dict:
@@ -310,21 +414,30 @@ def _as_mapping(value: Any) -> Mapping:
 
 
 def reject_external(doctype: dict) -> bool:
-    """Return True when a DOCTYPE names an external entity or external DTD."""
+    """Return True when a DOCTYPE names an external entity or external DTD.
+
+    Any external identifier is rejected, whatever its scheme: a document
+    store is never consulted, so an external identifier can only ever be a
+    way to reach the network or the filesystem.
+    """
 
     if not isinstance(doctype, Mapping):
         return True
 
-    external_id = str(doctype.get("external_id") or "").lower()
-    if external_id.startswith("file:"):
+    if doctype.get("external_id") or doctype.get("public_id"):
         return True
 
     for entity in _as_mapping(doctype.get("entities")).values():
         if not isinstance(entity, Mapping):
-            continue
-        system_id = str(entity.get("system_id") or "").lower()
-        if entity.get("external") and system_id.startswith("file:"):
             return True
+        if entity.get("external"):
+            return True
+        if entity.get("system_id") or entity.get("public_id"):
+            return True
+
+    # Also honour a pre-computed list, in case a caller supplies one.
+    if _as_mapping(doctype).get("external_entities"):
+        return True
 
     return False
 
@@ -338,26 +451,62 @@ def _policy_limit(policy: Mapping | None, key: str, default: int) -> int:
     return value
 
 
-def _entity_depth(entity_name: str, entities: Mapping, memo: dict, trail: frozenset) -> int:
-    if entity_name in memo:
-        return memo[entity_name]
-    if entity_name in trail:
-        raise ValueError("entity cycle")
+def _entity_value(entity: Mapping) -> str:
+    value = entity.get("value")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    return value
 
-    entity = _as_mapping(entities.get(entity_name))
-    value = entity.get("value") or ""
-    references = set(_ENTITY_REF_RE.findall(str(value)))
-    references.update(_PARAM_REF_RE.findall(str(value)))
 
-    depth = 1
-    for reference in references:
-        if reference in entities:
-            depth = max(
-                depth,
-                1 + _entity_depth(reference, entities, memo, trail | {entity_name}),
-            )
-    memo[entity_name] = depth
-    return depth
+def _entity_references(value: str) -> set[str]:
+    references = set(_ENTITY_REF_RE.findall(value))
+    references.update(_PARAM_REF_RE.findall(value))
+    return references
+
+
+def _entity_depths(
+    entities: Mapping,
+    cycles: set[str],
+) -> dict[str, int | None]:
+    """Compute the expansion depth of every declared entity.
+
+    Depth one means an entity whose value references no other declared
+    entity.  A value that participates in a cycle is reported as ``None``.
+    The computation is memoised so an entity graph with heavy sharing is
+    still cheap.
+    """
+
+    memo: dict[str, int | None] = {}
+
+    def visit(name: str, trail: frozenset[str]) -> int | None:
+        if name in memo:
+            return memo[name]
+        if name in trail:
+            cycles.add(name)
+            return None
+
+        entity = _as_mapping(entities.get(name))
+        references = _entity_references(_entity_value(entity))
+
+        depth = 1
+        for reference in references:
+            if reference not in entities:
+                continue
+            child = visit(reference, trail | {name})
+            if child is None:
+                cycles.add(name)
+                memo[name] = None
+                return None
+            depth = max(depth, 1 + child)
+
+        memo[name] = depth
+        return depth
+
+    for name in entities:
+        visit(name, frozenset())
+    return memo
 
 
 def check_entities(doctype: dict, policy: dict) -> list[str]:
@@ -374,25 +523,33 @@ def check_entities(doctype: dict, policy: dict) -> list[str]:
     max_entities = _policy_limit(policy, "max_entities", DEFAULT_MAX_ENTITIES)
     max_depth = _policy_limit(policy, "max_entity_depth", DEFAULT_MAX_ENTITY_DEPTH)
 
-    external_count = sum(
-        1 for entity in entities.values() if bool(entity.get("external"))
-    )
-    if external_count > max_entities:
-        problems.append(f"too_many_entities:{external_count}>{max_entities}")
+    total = len(entities)
+    if total > max_entities:
+        problems.append(f"too_many_entities:{total}>{max_entities}")
 
-    for name, entity in entities.items():
-        value = str(entity.get("value") or "")
-        direct_references = len(_ENTITY_REF_RE.findall(value))
-        if direct_references > max_depth:
-            problems.append(
-                f"entity_depth_exceeded:{name}:{direct_references}>{max_depth}"
-            )
+    cycles: set[str] = set()
+    depths = _entity_depths(entities, cycles)
+
+    for name in entities:
+        depth = depths.get(name)
+        if depth is None:
+            continue
+        if depth > max_depth:
+            problems.append(f"entity_depth_exceeded:{name}:{depth}>{max_depth}")
+
+    for name in sorted(cycles):
+        problems.append(f"entity_cycle:{name}")
 
     return problems
 
 
 def check_scheme(uri: str) -> bool:
-    """Return True when an entity identifier uses a permitted scheme."""
+    """Return True when an entity identifier uses a permitted scheme.
+
+    Only schemes in :data:`SAFE_SCHEMES` are permitted.  In particular
+    ``file``, ``http`` and ``https`` are not, and a relative reference with
+    no scheme is not either.
+    """
 
     if not isinstance(uri, str) or not uri.strip():
         return False
@@ -400,22 +557,12 @@ def check_scheme(uri: str) -> bool:
         parts = urlsplit(uri.strip())
     except ValueError:
         return False
-    return bool(parts.scheme)
+    return parts.scheme.lower() in SAFE_SCHEMES
 
 
 # ---------------------------------------------------------------------------
 # XML parsing
 # ---------------------------------------------------------------------------
-
-
-def _resolve_external(uri: str) -> str:
-    """Resolve an external identifier.
-
-    Resolution is kept in one place so callers can replace it when a document
-    store is available.  This implementation does not open sockets or files.
-    """
-
-    return ""
 
 
 def _strip_doctype(text: str) -> str:
@@ -430,41 +577,95 @@ def _expand_entities(
     text: str,
     entities: Mapping,
     policy: Mapping,
-    cache: Mapping | None,
-    allow_external: bool,
+    state: list[int],
+    depth: int,
 ) -> str:
-    def replace(match: re.Match) -> str:
-        name = match.group(1)
-        if name in _XML_BUILTINS:
-            return match.group(0)
+    """Expand internal entity references without touching markup constructs.
 
-        entity: Any = None
-        if isinstance(cache, Mapping) and name in cache:
-            entity = cache[name]
-        elif name in entities:
-            entity = entities[name]
+    References inside comments, CDATA sections and processing instructions
+    are left alone, as the XML specification requires.  Expansion is bounded
+    both in depth and in total output so a hostile entity graph cannot make
+    the process exhaust memory or time.
+    """
 
-        if not isinstance(entity, Mapping):
-            return match.group(0)
+    max_depth = _policy_limit(policy, "max_entity_depth", DEFAULT_MAX_ENTITY_DEPTH)
 
-        if entity.get("external"):
-            if not allow_external:
+    parts: list[str] = []
+    index = 0
+    length = len(text)
+
+    while index < length:
+        char = text[index]
+
+        if char == "<":
+            if text.startswith("<!--", index):
+                end = _skip_comment(text, index)
+                parts.append(text[index:end])
+                index = end
+                continue
+            if text.startswith("<![CDATA[", index):
+                end = _skip_cdata(text, index)
+                parts.append(text[index:end])
+                index = end
+                continue
+            if text.startswith("<?", index):
+                end = _skip_pi(text, index)
+                parts.append(text[index:end])
+                index = end
+                continue
+            parts.append(char)
+            index += 1
+            continue
+
+        if char == "&":
+            match = _ENTITY_REF_RE.match(text, index)
+            if match is None:
+                parts.append(char)
+                index += 1
+                continue
+
+            name = match.group(1)
+            if name in _XML_BUILTINS:
+                parts.append(match.group(0))
+                index = match.end()
+                continue
+
+            entity = entities.get(name)
+            if not isinstance(entity, Mapping):
+                raise XXEParseError("undefined entity: " + name)
+            if entity.get("external"):
                 raise XXESecurityError(
                     "external entity reference is not allowed: " + name
                 )
-            replacement = _resolve_external(str(entity.get("system_id") or ""))
-            if not isinstance(replacement, str):
-                replacement = ""
-        else:
-            replacement = entity.get("value")
-            if replacement is None:
-                replacement = ""
-            if not isinstance(replacement, str):
-                replacement = str(replacement)
 
-        return _expand_entities(replacement, entities, policy, cache, allow_external)
+            if depth + 1 > max_depth:
+                raise XXESecurityError(
+                    f"entity expansion depth exceeded at {name}: "
+                    f"{depth + 1}>{max_depth}"
+                )
 
-    return _ENTITY_REF_RE.sub(replace, text)
+            state[0] += 1
+            if state[0] > MAX_ENTITY_EXPANSIONS:
+                raise XXESecurityError("too many entity expansions")
+
+            expansion = _expand_entities(
+                _entity_value(entity),
+                entities,
+                policy,
+                state,
+                depth + 1,
+            )
+            state[1] += len(expansion)
+            if state[1] > MAX_EXPANDED_CHARS:
+                raise XXESecurityError("entity expansion output is too large")
+            parts.append(expansion)
+            index = match.end()
+            continue
+
+        parts.append(char)
+        index += 1
+
+    return "".join(parts)
 
 
 class _TreeBuilder:
@@ -495,7 +696,16 @@ class _TreeBuilder:
             parent.text = (parent.text or "") + data
 
 
-def _parse_tree(text: str, lenient: bool) -> Element:
+def _reject_dtd(*_args: Any) -> None:
+    raise XXESecurityError("DTD constructs are not allowed in the document body")
+
+
+def _refuse_external(*_args: Any) -> int:
+    # Returning 0 aborts the parse instead of resolving anything.
+    return 0
+
+
+def _parse_tree(text: str) -> Element:
     builder = _TreeBuilder()
     parser = expat.ParserCreate()
     parser.StartElementHandler = builder.start
@@ -503,13 +713,25 @@ def _parse_tree(text: str, lenient: bool) -> Element:
     parser.CharacterDataHandler = builder.data
     parser.ProcessingInstructionHandler = lambda _target, _data: None
     parser.CommentHandler = lambda _data: None
-    parser.ExternalEntityRefHandler = lambda *_args: 0
+
+    # Defence in depth: the DOCTYPE has already been stripped, so expat must
+    # never see a DTD construct.  If one slips through it is rejected.
+    parser.StartDoctypeDeclHandler = _reject_dtd
+    parser.EntityDeclHandler = _reject_dtd
+    parser.UnparsedEntityDeclHandler = _reject_dtd
+    parser.NotationDeclHandler = _reject_dtd
+    parser.ElementDeclHandler = _reject_dtd
+    parser.AttlistDeclHandler = _reject_dtd
+    parser.ExternalEntityRefHandler = _refuse_external
+
+    try:
+        parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    except (AttributeError, ValueError):  # pragma: no cover - platform detail
+        pass
 
     try:
         parser.Parse(text, True)
     except expat.ExpatError as exc:
-        if lenient and builder.root is not None:
-            return builder.root
         raise XXEParseError(f"malformed document: {exc}") from exc
 
     if builder.root is None:
@@ -517,30 +739,21 @@ def _parse_tree(text: str, lenient: bool) -> Element:
     return builder.root
 
 
-def _parse_body(
-    text: str,
-    doctype: Mapping,
-    policy: Mapping,
-    cache: Mapping | None,
-    allow_external: bool,
-    lenient: bool,
-) -> Element:
+def _parse_body(text: str, doctype: Mapping, policy: Mapping) -> Element:
     body = _strip_doctype(text)
+    # Any DTD construct that survived the strip is refused by the parser's
+    # declaration handlers in ``_parse_tree``.
     expanded = _expand_entities(
         body,
         _as_mapping(doctype.get("entities")),
         policy,
-        cache,
-        allow_external,
+        [0, 0],
+        0,
     )
-    return _parse_tree(expanded, lenient)
+    return _parse_tree(expanded)
 
 
-def _parse_document(
-    text: str,
-    policy: dict,
-    shared_entities: dict | None = None,
-) -> Element:
+def _parse_document(text: str, policy: dict) -> Element:
     if not isinstance(text, str):
         raise XXEParseError("document must be text")
 
@@ -552,28 +765,33 @@ def _parse_document(
     if reject_external(doctype):
         raise XXESecurityError("external identifiers are not allowed")
 
-    entity_problems = check_entities(doctype, policy)
+    try:
+        entity_problems = check_entities(doctype, policy)
+    except RecursionError as exc:
+        raise XXESecurityError("entity graph is too deep") from exc
     if entity_problems:
         raise XXESecurityError("entity policy violation: " + "; ".join(entity_problems))
 
-    cache = shared_entities if shared_entities is not None else {}
-    root = _parse_body(
-        text,
-        doctype,
-        policy,
-        cache,
-        allow_external=True,
-        lenient=True,
-    )
+    try:
+        root = _parse_body(text, doctype, policy)
+    except RecursionError as exc:
+        raise XXESecurityError("entity expansion is too deep") from exc
 
-    if shared_entities is not None:
-        shared_entities.update(_as_mapping(doctype.get("entities")))
+    element_problems = check_elements(root, policy.get("allowed_elements") or [])
+    if element_problems:
+        raise XXESecurityError(
+            "element policy violation: " + "; ".join(element_problems)
+        )
 
     return root
 
 
 def parse_document(text: str, policy: dict) -> Element:
-    """Parse one document with the configured DTD and element policy."""
+    """Parse one document with the configured DTD and element policy.
+
+    Any rule violation raises a :class:`ValueError` subclass.  No partial
+    result is returned and no external resource is ever read.
+    """
 
     return _parse_document(text, policy)
 
@@ -611,6 +829,12 @@ def validate_policy(policy: dict) -> list[str]:
         return ["policy_must_be_a_mapping"]
 
     problems: list[str] = []
+
+    if policy.get("allow_external_entities") is not False:
+        problems.append("allow_external_entities_must_be_false")
+    if policy.get("allow_external_dtd") is not False:
+        problems.append("allow_external_dtd_must_be_false")
+
     if not _positive_int(policy.get("max_entities")):
         problems.append("max_entities_missing")
     if not _positive_int(policy.get("max_entity_depth")):
@@ -626,17 +850,20 @@ def validate_policy(policy: dict) -> list[str]:
 
 
 def xxe_batch(docs: list[str], policy: dict) -> dict:
-    """Parse several documents and return one result and error per document."""
+    """Parse several documents and return one result and error per document.
+
+    Documents are parsed in isolation: no entity, whitelist or parser state
+    is shared between iterations, so a failure only affects its own slot.
+    """
 
     results: list[Element | None] = []
     errors: list[str | None] = []
-    shared_entities: dict = {}
 
     for document in docs or []:
         try:
             if isinstance(document, bytes):
                 document = document.decode("utf-8")
-            root = _parse_document(document, policy, shared_entities)
+            root = parse_document(document, policy)
             results.append(root)
             errors.append(None)
         except Exception as exc:
